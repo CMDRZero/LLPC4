@@ -1,0 +1,548 @@
+const std = @import("std");
+
+const Ast = @import("Ast.zig");
+const Node = Ast.Node;
+const Tokenizer = @import("Tokenizer.zig");
+const Token = Tokenizer.Token;
+
+const Parse = @This();
+gpa: std.mem.Allocator,
+sourceFile: []const u8,
+qerror: ?Error,
+
+censureIsError: bool = true,
+warningIsError: bool = false,
+
+prevToken: ?Token = null,
+untokenStream: []const u8,
+
+pub fn init(gpa: std.mem.Allocator, sourceFile: []const u8, defaults: struct { censureIsError: bool = true, warningIsError: bool = false }) Parse {
+    return .{
+        .gpa = gpa,
+        .sourceFile = sourceFile,
+        .qerror = null,
+        .censureIsError = defaults.censureIsError,
+        .warningIsError = defaults.warningIsError,
+        .prevToken = null,
+        .untokenStream = sourceFile,
+    };
+}
+
+pub const MessageType = enum {
+    warning_,
+    censure_,
+    error_,
+};
+
+pub fn throw(self: Parse, kind: MessageType) !void {
+    switch (kind) {
+        .warning_ => if (self.warningIsError) return error.compilation_failure else {},
+        .censure_ => if (self.censureIsError) return error.compilation_failure else {},
+        .error_ => return error.compilation_failure,
+    }
+}
+
+pub const Error = struct {
+    annots: []Annotation,
+
+    pub const Annotation = struct {
+        msg: []const u8,
+        kind: MessageType,
+        marks: []Mark,
+
+        pub const Mark = struct {
+            mark: u8,
+            line: usize,
+            colStart: usize,
+            len: usize,
+        };
+    };
+};
+
+pub fn printError(self: Parse) void {
+    if (self.qerror == null) return;
+    const err = self.qerror.?;
+    const totLines = std.mem.count(u8, self.sourceFile, "\n") + 1;
+    const digitsForLine: u8 = @intCast(1 + std.math.log10(@max(0, totLines)));
+
+    for (err.annots) |annot| {
+        var lines: std.ArrayList(usize) = .empty;
+        defer lines.deinit(self.gpa);
+
+        for (annot.marks) |mark| {
+            for (lines.items) |line| {
+                if (mark.line == line) break;
+            } else {
+                lines.append(self.gpa, mark.line) catch unreachable;
+            }
+        }
+
+        std.mem.sort(usize, lines.items, {}, struct {
+            fn lt(_: void, a: usize, b: usize) bool {
+                return a < b;
+            }
+        }.lt);
+
+        for (0..digitsForLine) |_| std.debug.print(" ", .{});
+        std.debug.print(" |\n", .{});
+        var prevline: usize = lines.items[0];
+        for (lines.items) |line| {
+            defer prevline = line;
+            if (line > prevline + 2) {
+                for (0..digitsForLine) |_| std.debug.print(" ", .{});
+                std.debug.print("...\n", .{});
+            } else if (line == prevline + 2) {
+                switch (digitsForLine) {
+                    inline 1...20 => |x| {
+                        const msg = comptime std.fmt.comptimePrint("{{: >{}}} |    {{s}}\n", .{x});
+                        const strline = self.getLine(prevline + 1);
+                        std.debug.print(msg, .{ line - 1, std.mem.trimStart(u8, strline, " \t") });
+                    },
+                    else => unreachable,
+                }
+            }
+            switch (digitsForLine) {
+                inline 1...20 => |x| {
+                    const msg = comptime std.fmt.comptimePrint("{{: >{}}} |    {{s}}\n", .{x});
+                    const strline = self.getLine(line);
+                    std.debug.print(msg, .{ line, std.mem.trimStart(u8, strline, " \t") });
+                },
+                else => unreachable,
+            }
+            var marks = " ".* ** 128;
+            for (annot.marks) |mark| {
+                if (mark.line != line) continue;
+                for (mark.colStart..mark.colStart + mark.len) |idx| marks[idx] = mark.mark;
+            }
+            for (0..digitsForLine) |_| std.debug.print(" ", .{});
+            std.debug.print(" |    {s}\n", .{marks});
+        }
+        const tagname = @tagName(annot.kind);
+        var buf: [256]u8 = undefined;
+        const prefix = std.ascii.upperString(&buf, tagname);
+        std.debug.print("{s}: {s}\n\n", .{ prefix[0 .. prefix.len - 1], annot.msg });
+    }
+}
+
+pub fn initError(self: *Parse) !void {
+    const annots = try self.gpa.alloc(Error.Annotation, 0);
+    self.qerror = .{
+        .annots = annots,
+    };
+}
+
+pub fn deinitError(self: *Parse) void {
+    if (self.qerror) |*eptr| {
+        for (eptr.annots) |annot| {
+            self.gpa.free(annot.marks);
+        }
+        self.gpa.free(eptr.annots);
+        self.qerror = null;
+    }
+}
+
+pub fn newAnnot(self: *Parse, kind: MessageType, msg: []const u8) !void {
+    const marks = try self.gpa.alloc(Error.Annotation.Mark, 0);
+    const oldannots = self.qerror.?.annots;
+    defer self.gpa.free(oldannots);
+    const newannots = try self.gpa.alloc(Error.Annotation, oldannots.len + 1);
+    @memcpy(newannots.ptr, oldannots);
+    newannots[oldannots.len] = .{
+        .msg = msg,
+        .kind = kind,
+        .marks = marks,
+    };
+    self.qerror = .{ .annots = newannots };
+}
+
+pub fn throwAnnot(self: Parse) !void {
+    const annots = self.qerror.?.annots;
+    const kind = annots[annots.len - 1].kind;
+    return self.throw(kind);
+}
+
+fn newMark(self: *Parse, mark: Error.Annotation.Mark) !void {
+    const annots = self.qerror.?.annots;
+    const oldmarks = annots[annots.len - 1].marks;
+    defer self.gpa.free(oldmarks);
+    const newmarks = try self.gpa.alloc(Error.Annotation.Mark, oldmarks.len + 1);
+    @memcpy(newmarks.ptr, oldmarks);
+    newmarks[oldmarks.len] = mark;
+    self.qerror.?.annots[annots.len - 1].marks = newmarks;
+}
+
+/// Assumes `str` is a subslice of `self.sourceFile`
+pub fn underlineSegment(self: *Parse, str: []const u8, defaults: struct { mark: u8 = '-' }) !void {
+    var ustr = str;
+    const srcline, const lineno = self.getLineStartOf(str);
+    const ltrim = srcline.len - std.mem.trimStart(u8, srcline, " \t").len;
+    for (str, 0..) |c, i| {
+        if (c == '\n') {
+            try self.underlineSegment(std.mem.trimStart(u8, str[i + 1 ..], " \t"), defaults);
+            ustr = str[0..i];
+            break;
+        }
+    }
+    try self.newMark(.{ .mark = defaults.mark, .colStart = ustr.ptr - srcline.ptr - ltrim, .len = ustr.len, .line = lineno });
+}
+
+fn getLineStartOf(self: Parse, line: []const u8) struct { []const u8, usize } {
+    const byteoffset = line.ptr - self.sourceFile.ptr;
+    var lineno: usize = 0;
+    var lastlinestart: usize = 0;
+    for (self.sourceFile[0..byteoffset], 0..) |c, i| {
+        if (c == '\n') {
+            lastlinestart = i + 1;
+            lineno += 1;
+        }
+    }
+    var srcline = self.sourceFile[lastlinestart..];
+    for (srcline, 0..) |c, len| {
+        if (c == '\n') return .{ srcline[0..len], lineno };
+    } else return .{ srcline, lineno };
+}
+
+fn getLine(self: Parse, line: usize) []const u8 {
+    var count: usize = 0;
+    for (self.sourceFile, 0..) |c, idx| {
+        if (count == line) {
+            if (c == '\r') continue;
+            var slice = self.sourceFile[idx..];
+            for (slice, 0..) |c2, len| {
+                if (c2 == '\n') return slice[0..len];
+            } else return slice;
+        }
+        if (c == '\n') {
+            count += 1;
+        }
+    } else unreachable;
+}
+
+pub fn nextToken(self: *Parse) !Token {
+    return Tokenizer.readToken(self.untokenStream, self.prevToken);
+}
+
+const Assoc = enum {
+    left,
+    none,
+};
+
+const PrecClass = struct {
+    major: Major,
+    minor: u8 = 0,
+    assoc: Assoc = Assoc.left,
+
+    const Major = enum(u3) {
+        arithmetic = 0,
+        bitwise = 1,
+        comparison = 2,
+        logical = 3,
+        coercion = 4,
+        root = 5,
+    };
+
+    pub const start: PrecClass = .{ .major = .root };
+
+    pub const Rel = enum(i2) {
+        lt = -1,
+        eq = 0,
+        gt = 1,
+
+        pub fn inverted(self: @This()) @This() {
+            return @enumFromInt(-@intFromEnum(self));
+        }
+    };
+
+    /// arith > coerc
+    /// bitwi > coerc
+    /// coerc > compr > logic > root
+    /// order[y][x] --> y cmp x
+    const major_ordering = b: {
+        const base_greater_than_relations = [_][2]Major{
+            .{ .arithmetic, .coercion },
+            .{ .bitwise, .coercion },
+            .{ .coercion, .comparison },
+            .{ .comparison, .logical },
+            .{ .logical, .root },
+        };
+
+        var order: [6][6]?Rel = @splat(@splat(null));
+        for (base_greater_than_relations) |relation| {
+            const i = @intFromEnum(relation[0]);
+            const j = @intFromEnum(relation[1]);
+            order[i][j] = .gt;
+        }
+
+        computeTransativeOrdering(&order);
+        break :b order;
+    };
+
+    pub fn cmp(lhs: PrecClass, rhs: PrecClass) ?Rel {
+        return lhs._cmp(rhs) orelse (rhs._cmp(lhs) orelse return null).inverted();
+    }
+
+    fn _cmp(lhs: PrecClass, rhs: PrecClass) ?Rel {
+        if (std.meta.eql(lhs, rhs)) return .eq;
+        if (lhs.major != rhs.major) {
+            return PrecClass.major_ordering[@intFromEnum(lhs.major)][@intFromEnum(rhs.major)];
+        } else if (lhs.major == .arithmetic) {
+            if (lhs.minor == 0 and rhs.minor == 2) return .gt;
+            if (lhs.minor == 1 and rhs.minor == 2) return .gt;
+            if (lhs.minor == 0 and rhs.minor == 1) return .eq;
+        } else if (lhs.major == .bitwise) {
+            if (lhs.minor == 0 and rhs.minor == 1) return .gt;
+            if (lhs.minor == 0 and rhs.minor == 3) return .gt;
+            if (lhs.minor == 1 and rhs.minor == 3) return .gt;
+        } else if (lhs.major == .logical) {
+            if (lhs.minor == 0 and rhs.minor == 1) return .gt;
+        }
+        return null;
+    }
+
+    fn computeTransativeOrdering(order: *[6][6]?Rel) void {
+        for (0..6) |i| for (0..6) |j| for (0..6) |k| {
+            if (order[i][k] == order[k][j] and order[i][k] != null) order[i][j] = order[i][k];
+        };
+        for (0..6) |i| for (0..6) |j| {
+            if (i == j) order[i][j] = .eq;
+            if (order[i][j] == null and order[j][i] != null) order[i][j] = order[j][i].?.inverted();
+        };
+    }
+};
+
+const OperInfo = struct {
+    prec: PrecClass,
+};
+
+// A table of binary operator information. Operator classes are as follows:
+//  arith 0:                 * *% *| /
+//  arith 1 nonchainable:    %
+//  arith 2:                 + - +% -% +| -|
+//  bitwi 0:                 << <<% <<| <<< >> >>>
+//  bitwi 1:                 & &~
+//  bitwi 2:                 ^ ^~
+//  bitwi 3:                 | |~
+//  coerc:                   orelse catch
+//  compr nonchainable:      == != < <= >= >
+//  logic 0:                 and
+//  logic 1:                 or
+// Class Ordering is this:
+//  arith > coerc
+//  bitwi > coerc
+//  coerc > compr > logic
+// With subclass order of this:
+//  a0 == a1 > a2
+//  b0 > b1 > b3
+//  l0 > l1
+const operTable = std.enums.directEnumArrayDefault(Token.Tag, OperInfo, null, 0, .{
+    .@"or" = .{ .prec = .{ .major = .logical, .minor = 1 } },
+
+    .@"and" = .{ .prec = .{ .major = .logical, .minor = 0 } },
+
+    .@"==" = .{ .prec = .{ .major = .comparison, .assoc = Assoc.none } },
+    .@"!=" = .{ .prec = .{ .major = .comparison, .assoc = Assoc.none } },
+    .@"<" = .{ .prec = .{ .major = .comparison, .assoc = Assoc.none } },
+    .@">" = .{ .prec = .{ .major = .comparison, .assoc = Assoc.none } },
+    .@"<=" = .{ .prec = .{ .major = .comparison, .assoc = Assoc.none } },
+    .@">=" = .{ .prec = .{ .major = .comparison, .assoc = Assoc.none } },
+
+    .@"&" = .{ .prec = .{ .major = .bitwise, .minor = 1 } },
+    .@"&~" = .{ .prec = .{ .major = .bitwise, .minor = 1 } },
+    .@"^" = .{ .prec = .{ .major = .bitwise, .minor = 2 } },
+    .@"^~" = .{ .prec = .{ .major = .bitwise, .minor = 2 } },
+    .@"|" = .{ .prec = .{ .major = .bitwise, .minor = 3 } },
+    .@"|~" = .{ .prec = .{ .major = .bitwise, .minor = 3 } },
+
+    .@"orelse" = .{ .prec = .{ .major = .coercion } },
+    .@"catch" = .{ .prec = .{ .major = .coercion } },
+
+    .@"<<" = .{ .prec = .{ .major = .bitwise, .minor = 0 } },
+    .@"<<%" = .{ .prec = .{ .major = .bitwise, .minor = 0 } },
+    .@"<<|" = .{ .prec = .{ .major = .bitwise, .minor = 0 } },
+    .@"<<<" = .{ .prec = .{ .major = .bitwise, .minor = 0 } },
+    .@">>" = .{ .prec = .{ .major = .bitwise, .minor = 0 } },
+    .@">>>" = .{ .prec = .{ .major = .bitwise, .minor = 0 } },
+
+    .@"+" = .{ .prec = .{ .major = .arithmetic, .minor = 2 } },
+    .@"+%" = .{ .prec = .{ .major = .arithmetic, .minor = 2 } },
+    .@"+|" = .{ .prec = .{ .major = .arithmetic, .minor = 2 } },
+    .@"-" = .{ .prec = .{ .major = .arithmetic, .minor = 2 } },
+    .@"-%" = .{ .prec = .{ .major = .arithmetic, .minor = 2 } },
+    .@"-|" = .{ .prec = .{ .major = .arithmetic, .minor = 2 } },
+
+    .@"*" = .{ .prec = .{ .major = .arithmetic, .minor = 0 } },
+    .@"*%" = .{ .prec = .{ .major = .arithmetic, .minor = 0 } },
+    .@"*|" = .{ .prec = .{ .major = .arithmetic, .minor = 0 } },
+    .@"/" = .{ .prec = .{ .major = .arithmetic, .minor = 0 } },
+
+    .@"%" = .{ .prec = .{ .major = .arithmetic, .minor = 1, .assoc = Assoc.none } },
+});
+
+fn parseExprPrecedence(p: *Parse, token: Token, min_exc_prec: PrecClass) !?Node {
+    var node = try p.parsePrefixExpr(token) orelse return null;
+
+    while (true) {
+        const tok_tag = p.tokenTag(p.tok_i);
+        const info = operTable[@as(usize, @intCast(@intFromEnum(tok_tag)))];
+        const rel = info.prec.cmp(min_exc_prec) orelse return p.fail(.ambiguous_operator_precedence);
+
+        if (rel == .lt) {
+            break;
+        }
+
+        if (min_exc_prec.major == info.prec.major and min_exc_prec.assoc == .none and info.prec.assoc == .none) {
+            if (info.prec.major == .comparison) {
+                return p.fail(.chained_comparison_operators);
+            } else {
+                return p.fail(.illegal_chained_operators);
+            }
+        }
+
+        if (rel == .eq) {
+            break;
+        }
+
+        const oper_token = p.nextToken();
+        // Special-case handling for "catch"
+        // if (tok_tag == .keyword_catch) {
+        //     _ = try p.parsePayload();
+        // }
+        const rhs = try p.parseExprPrecedence(info.prec) orelse {
+            try p.warn(.expected_expr);
+            return node;
+        };
+
+        {
+            const tok_len = tok_tag.lexeme().?.len;
+            const char_before = p.source[p.tokenStart(oper_token) - 1];
+            const char_after = p.source[p.tokenStart(oper_token) + tok_len];
+            if (tok_tag == .ampersand and char_after == '&') {
+                // without types we don't know if '&&' was intended as 'bitwise_and address_of', or a c-style logical_and
+                // The best the parser can do is recommend changing it to 'and' or ' & &'
+                try p.warnMsg(.{ .tag = .invalid_ampersand_ampersand, .token = oper_token });
+            } else if (std.ascii.isWhitespace(char_before) != std.ascii.isWhitespace(char_after)) {
+                try p.warnMsg(.{ .tag = .mismatched_binary_op_whitespace, .token = oper_token });
+            }
+        }
+
+        node = try p.addNode(.{
+            .tag = info.tag,
+            .main_token = oper_token,
+            .data = .{ .node_and_node = .{ node, rhs } },
+        });
+    }
+
+    return node;
+}
+
+fn parsePrefixExpr(p: *Parse, token: Token) !?Node {
+    _ = switch (token.tag) {
+        .@"!", .@"~", .@"try", .@"-", .@"-%" => {},
+        else => return p.parsePrimaryExpr(token),
+    };
+    const rhsptr = try p.gpa.create(Node);
+    const nexttkn = p.nextToken();
+    rhsptr.* = try p.expectPrefixExpr(nexttkn);
+    return .{
+        .main_token = nexttkn,
+        .data = .{
+            .op_suffix_unary = .{
+                .result_type = null,
+                .rhs = rhsptr,
+            }
+        }
+    };
+}
+
+fn parseExpr(p: *Parse) !?Node {
+    return p.parseExprPrecedence(.start);
+}
+
+test "Error" {
+    if (1 == 1) return;
+    var marks = [_]Error.Annotation.Mark{
+        .{
+            .mark = '-',
+            .line = 1,
+            .colStart = 7,
+            .len = 9,
+        },
+        .{
+            .mark = '^',
+            .line = 1,
+            .colStart = 7 + 2,
+            .len = 1,
+        },
+        .{
+            .mark = '^',
+            .line = 1,
+            .colStart = 7 + 6,
+            .len = 1,
+        },
+    };
+    var annots = [_]Error.Annotation{
+        .{ .kind = .censure_, .msg = "Test", .marks = &marks },
+    };
+    const testError = Error{ .annots = &annots };
+
+    const p: Parse = .{
+        .gpa = std.testing.allocator,
+        .sourceFile =
+        \\fn Main() void {
+        \\  return 1 + 2 & 3;
+        \\}",
+        ,
+        .qerror = testError,
+    };
+
+    p.printError();
+}
+
+test "Error using Functions" {
+    if (1 == 1) return;
+    var p: Parse = .{
+        .gpa = std.testing.allocator,
+        .sourceFile =
+        \\fn Main() void {
+        \\  return 1 + 2 & 3;
+        \\}
+        ,
+        .qerror = null,
+    };
+
+    try p.initError();
+    defer p.deinitError();
+    defer p.printError();
+
+    try p.newAnnot(.censure_, "TEST BUT CLEANER");
+    try p.underlineSegment(p.sourceFile[26..][0..9], .{});
+    try p.underlineSegment(p.sourceFile[26..][2..3], .{ .mark = '^' });
+    try p.underlineSegment(p.sourceFile[26..][6..7], .{ .mark = '^' });
+    p.throwAnnot() catch {};
+
+    try p.newAnnot(.censure_, "TEST AGAIN");
+    try p.underlineSegment(p.sourceFile[0..25], .{ .mark = '~' });
+    p.throwAnnot() catch {};
+
+    try p.newAnnot(.warning_, "Split Message");
+    try p.underlineSegment(p.sourceFile[0..1], .{ .mark = '*' });
+    try p.underlineSegment(p.sourceFile[37..38], .{ .mark = '*' });
+    try p.throwAnnot();
+
+    try p.newAnnot(.error_, "MULTIPLE ANNOTATIONS!!!");
+    try p.underlineSegment(p.sourceFile[26..], .{ .mark = '^' });
+    try p.throwAnnot();
+    //We leave this some specifically so it can throw an error which gets caught and printed
+}
+
+test "Precedence" {
+    var p: Parse = .init(std.testing.allocator,
+        \\x + y * z
+    , .{});
+
+    try p.initError();
+    defer p.deinitError();
+    defer p.printError();
+
+    _ = try p.parseExpr();
+}
