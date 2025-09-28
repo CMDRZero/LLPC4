@@ -9,6 +9,7 @@ const int = std.math.big.int;
 
 const Parse = @This();
 gpa: std.mem.Allocator,
+writer: *std.io.Writer,
 sourceFile: []const u8,
 qerror: ?Error,
 
@@ -16,7 +17,7 @@ censureIsError: bool = true,
 warningIsError: bool = false,
 
 prevToken: ?Token = null,
-untokenStream: []const u8,
+untokenStream: []const u8 = undefined,
 
 pub fn init(gpa: std.mem.Allocator, sourceFile: []const u8, defaults: struct { censureIsError: bool = true, warningIsError: bool = false }) Parse {
     return .{
@@ -85,20 +86,20 @@ pub fn printError(self: Parse) void {
             }
         }.lt);
 
-        for (0..digitsForLine) |_| std.debug.print(" ", .{});
-        std.debug.print(" |\n", .{});
+        for (0..digitsForLine) |_| self.writer.print(" ", .{}) catch {};
+        self.writer.print(" |\n", .{}) catch {};
         var prevline: usize = lines.items[0];
         for (lines.items) |line| {
             defer prevline = line;
             if (line > prevline + 2) {
-                for (0..digitsForLine) |_| std.debug.print(" ", .{});
-                std.debug.print("...\n", .{});
+                for (0..digitsForLine) |_| self.writer.print(" ", .{}) catch {};
+                self.writer.print("...\n", .{}) catch {};
             } else if (line == prevline + 2) {
                 switch (digitsForLine) {
                     inline 1...20 => |x| {
                         const msg = comptime std.fmt.comptimePrint("{{: >{}}} |    {{s}}\n", .{x});
                         const strline = self.getLine(prevline + 1);
-                        std.debug.print(msg, .{ line - 1, std.mem.trimStart(u8, strline, " \t") });
+                        self.writer.print(msg, .{ line - 1, std.mem.trimStart(u8, strline, " \t") }) catch {};
                     },
                     else => unreachable,
                 }
@@ -107,7 +108,7 @@ pub fn printError(self: Parse) void {
                 inline 1...20 => |x| {
                     const msg = comptime std.fmt.comptimePrint("{{: >{}}} |    {{s}}\n", .{x});
                     const strline = self.getLine(line);
-                    std.debug.print(msg, .{ line, std.mem.trimStart(u8, strline, " \t") });
+                    self.writer.print(msg, .{ line, std.mem.trimStart(u8, strline, " \t") }) catch {};
                 },
                 else => unreachable,
             }
@@ -116,13 +117,18 @@ pub fn printError(self: Parse) void {
                 if (mark.line != line) continue;
                 for (mark.colStart..mark.colStart + mark.len) |idx| marks[idx] = mark.mark;
             }
-            for (0..digitsForLine) |_| std.debug.print(" ", .{});
-            std.debug.print(" |    {s}\n", .{marks});
+            var strlen: usize = marks.len;
+            while (strlen > 0) {
+                if (marks[strlen - 1] != ' ') break;
+                strlen -= 1;
+            }
+            for (0..digitsForLine) |_| self.writer.print(" ", .{}) catch {};
+            self.writer.print(" |    {s}\n", .{marks[0..strlen]}) catch {};
         }
         const tagname = @tagName(annot.kind);
         var buf: [256]u8 = undefined;
         const prefix = std.ascii.upperString(&buf, tagname);
-        std.debug.print("{s}: {s}\n\n", .{ prefix[0 .. prefix.len - 1], annot.msg });
+        self.writer.print("{s}: {s}\n\n", .{ prefix[0 .. prefix.len - 1], annot.msg }) catch {};
     }
 }
 
@@ -567,50 +573,15 @@ pub fn parseInteger(alloc: std.mem.Allocator, string: [] const u8) !int.Managed 
     return cumulative;
 }
 
-test "Error" {
-    if (1 == 1) return;
-    var marks = [_]Error.Annotation.Mark{
-        .{
-            .mark = '-',
-            .line = 1,
-            .colStart = 7,
-            .len = 9,
-        },
-        .{
-            .mark = '^',
-            .line = 1,
-            .colStart = 7 + 2,
-            .len = 1,
-        },
-        .{
-            .mark = '^',
-            .line = 1,
-            .colStart = 7 + 6,
-            .len = 1,
-        },
-    };
-    var annots = [_]Error.Annotation{
-        .{ .kind = .censure_, .msg = "Test", .marks = &marks },
-    };
-    const testError = Error{ .annots = &annots };
 
-    const p: Parse = .{
-        .gpa = std.testing.allocator,
-        .sourceFile =
-        \\fn Main() void {
-        \\  return 1 + 2 & 3;
-        \\}",
-        ,
-        .qerror = testError,
-    };
-
-    p.printError();
-}
 
 test "Error using Functions" {
-    if (1 == 1) return;
+    var allocWriter: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocWriter.deinit();
+
     var p: Parse = .{
         .gpa = std.testing.allocator,
+        .writer = &allocWriter.writer,
         .sourceFile =
         \\fn Main() void {
         \\  return 1 + 2 & 3;
@@ -618,30 +589,61 @@ test "Error using Functions" {
         ,
         .qerror = null,
     };
+    {
+        try p.initError();
+        defer p.deinitError();
+        defer p.printError();
 
-    try p.initError();
-    defer p.deinitError();
-    defer p.printError();
+        try p.newAnnot(.censure_, "TEST BUT CLEANER");
+        try p.underlineSegment(p.sourceFile[26..][0..9], .{});
+        try p.underlineSegment(p.sourceFile[26..][2..3], .{ .mark = '^' });
+        try p.underlineSegment(p.sourceFile[26..][6..7], .{ .mark = '^' });
+        p.throwAnnot() catch {};
 
-    try p.newAnnot(.censure_, "TEST BUT CLEANER");
-    try p.underlineSegment(p.sourceFile[26..][0..9], .{});
-    try p.underlineSegment(p.sourceFile[26..][2..3], .{ .mark = '^' });
-    try p.underlineSegment(p.sourceFile[26..][6..7], .{ .mark = '^' });
-    p.throwAnnot() catch {};
+        try p.newAnnot(.censure_, "TEST AGAIN");
+        try p.underlineSegment(p.sourceFile[0..25], .{ .mark = '~' });
+        p.throwAnnot() catch {};
 
-    try p.newAnnot(.censure_, "TEST AGAIN");
-    try p.underlineSegment(p.sourceFile[0..25], .{ .mark = '~' });
-    p.throwAnnot() catch {};
+        try p.newAnnot(.warning_, "Split Message");
+        try p.underlineSegment(p.sourceFile[0..1], .{ .mark = '*' });
+        try p.underlineSegment(p.sourceFile[37..38], .{ .mark = '*' });
+        try p.throwAnnot();
 
-    try p.newAnnot(.warning_, "Split Message");
-    try p.underlineSegment(p.sourceFile[0..1], .{ .mark = '*' });
-    try p.underlineSegment(p.sourceFile[37..38], .{ .mark = '*' });
-    try p.throwAnnot();
-
-    try p.newAnnot(.error_, "MULTIPLE ANNOTATIONS!!!");
-    try p.underlineSegment(p.sourceFile[26..], .{ .mark = '^' });
-    try p.throwAnnot();
-    //We leave this some specifically so it can throw an error which gets caught and printed
+        try p.newAnnot(.error_, "MULTIPLE ANNOTATIONS!!!");
+        try p.underlineSegment(p.sourceFile[26..], .{ .mark = '^' });
+        p.throwAnnot() catch {};
+    }
+    try std.testing.expectEqualStrings(
+\\  |
+\\1 |    return 1 + 2 & 3;
+\\  |           --^---^--
+\\CENSURE: TEST BUT CLEANER
+\\
+\\  |
+\\0 |    fn Main() void {
+\\  |    ~~~~~~~~~~~~~~~~
+\\1 |    return 1 + 2 & 3;
+\\  |    ~~~~~~
+\\CENSURE: TEST AGAIN
+\\
+\\  |
+\\0 |    fn Main() void {
+\\  |    *
+\\1 |    return 1 + 2 & 3;
+\\2 |    }
+\\  |    *
+\\WARNING: Split Message
+\\
+\\  |
+\\1 |    return 1 + 2 & 3;
+\\  |           ^^^^^^^^^^
+\\2 |    }
+\\  |    ^
+\\ERROR: MULTIPLE ANNOTATIONS!!!
+\\
+\\
+        , allocWriter.written(),
+    );
 }
 
 // test "Precedence" {
@@ -654,5 +656,5 @@ test "Error using Functions" {
 //     defer p.printError();
 
 //     const node = try p.parseExpr();
-//     std.debug.print("Node is {}\n", .{node});
+//     std.debug.print("Node is {}\n", .{node}) catch {};
 // }
