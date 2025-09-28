@@ -35,26 +35,26 @@ pub const AddrLock = struct {
     }
 };
 
-pub fn parseInt(alloc: Allocator, p: Parse, str: [] const u8) !int.Const {
-    const ret = try int.Managed.initSet(alloc, 0); 
-    var val = str;
-    var base: usize = 10;
-    if (str[0] == '0' and str[1] == 'd') {
-        val = val[2..];
-    } else if (str[0] == '0' and str[1] == 'x') {
-        base = 16;
-        val = val[2..];
-    } else if (str[0] == '0' and str[1] == 'o') {
-        base = 8;
-        val = val[2..];
-    } else if (str[0] == '0' and str[1] == 'b') {
-        base = 2;
-        val = val[2..];
-    }
-    const baseAsBigInt = try int.Managed.initSet(alloc, base);
-    for (val) |c| {
-        if (c == '_') continue;
-        try ret.mul(&ret, &baseAsBigInt);
-        const digitValue = switch ()
-    }
-}
+// pub fn parseInt(alloc: Allocator, p: Parse, str: [] const u8) !int.Const {
+//     const ret = try int.Managed.initSet(alloc, 0); 
+//     var val = str;
+//     var base: usize = 10;
+//     if (str[0] == '0' and str[1] == 'd') {
+//         val = val[2..];
+//     } else if (str[0] == '0' and str[1] == 'x') {
+//         base = 16;
+//         val = val[2..];
+//     } else if (str[0] == '0' and str[1] == 'o') {
+//         base = 8;
+//         val = val[2..];
+//     } else if (str[0] == '0' and str[1] == 'b') {
+//         base = 2;
+//         val = val[2..];
+//     }
+//     const baseAsBigInt = try int.Managed.initSet(alloc, base);
+//     for (val) |c| {
+//         if (c == '_') continue;
+//         try ret.mul(&ret, &baseAsBigInt);
+//         const digitValue = switch ()
+//     }
+// }

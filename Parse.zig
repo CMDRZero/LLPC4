@@ -1,9 +1,11 @@
 const std = @import("std");
 
 const Ast = @import("Ast.zig");
-const Node = Ast.Node;
+const Node = Ast.Expr;
 const Tokenizer = @import("Tokenizer.zig");
 const Token = Tokenizer.Token;
+
+const int = std.math.big.int;
 
 const Parse = @This();
 gpa: std.mem.Allocator,
@@ -378,84 +380,191 @@ const operTable = std.enums.directEnumArrayDefault(Token.Tag, OperInfo, null, 0,
     .@"%" = .{ .prec = .{ .major = .arithmetic, .minor = 1, .assoc = Assoc.none } },
 });
 
-fn parseExprPrecedence(p: *Parse, token: Token, min_exc_prec: PrecClass) !?Node {
-    var node = try p.parsePrefixExpr(token) orelse return null;
+// fn parseExprPrecedence(p: *Parse, token: Token, min_exc_prec: PrecClass) !?Node {
+//     var node = try p.parsePrefixExpr(token) orelse return null;
 
-    while (true) {
-        const tok_tag = p.tokenTag(p.tok_i);
-        const info = operTable[@as(usize, @intCast(@intFromEnum(tok_tag)))];
-        const rel = info.prec.cmp(min_exc_prec) orelse return p.fail(.ambiguous_operator_precedence);
+//     while (true) {
+//         const tok_tag = p.tokenTag(p.tok_i);
+//         const info = operTable[@as(usize, @intCast(@intFromEnum(tok_tag)))];
+//         const rel = info.prec.cmp(min_exc_prec) orelse return p.fail(.ambiguous_operator_precedence);
 
-        if (rel == .lt) {
-            break;
+//         if (rel == .lt) {
+//             break;
+//         }
+
+//         if (min_exc_prec.major == info.prec.major and min_exc_prec.assoc == .none and info.prec.assoc == .none) {
+//             if (info.prec.major == .comparison) {
+//                 return p.fail(.chained_comparison_operators);
+//             } else {
+//                 return p.fail(.illegal_chained_operators);
+//             }
+//         }
+
+//         if (rel == .eq) {
+//             break;
+//         }
+
+//         const oper_token = p.nextToken();
+//         // Special-case handling for "catch"
+//         // if (tok_tag == .keyword_catch) {
+//         //     _ = try p.parsePayload();
+//         // }
+//         const rhs = try p.parseExprPrecedence(info.prec) orelse {
+//             try p.warn(.expected_expr);
+//             return node;
+//         };
+
+//         {
+//             const tok_len = tok_tag.lexeme().?.len;
+//             const char_before = p.source[p.tokenStart(oper_token) - 1];
+//             const char_after = p.source[p.tokenStart(oper_token) + tok_len];
+//             if (tok_tag == .ampersand and char_after == '&') {
+//                 // without types we don't know if '&&' was intended as 'bitwise_and address_of', or a c-style logical_and
+//                 // The best the parser can do is recommend changing it to 'and' or ' & &'
+//                 try p.warnMsg(.{ .tag = .invalid_ampersand_ampersand, .token = oper_token });
+//             } else if (std.ascii.isWhitespace(char_before) != std.ascii.isWhitespace(char_after)) {
+//                 try p.warnMsg(.{ .tag = .mismatched_binary_op_whitespace, .token = oper_token });
+//             }
+//         }
+
+//         node = try p.addNode(.{
+//             .tag = info.tag,
+//             .main_token = oper_token,
+//             .data = .{ .node_and_node = .{ node, rhs } },
+//         });
+//     }
+
+//     return node;
+// }
+
+// fn parsePrefixExpr(p: *Parse, token: Token) !?Node {
+//     _ = switch (token.tag) {
+//         .@"!", .@"~", .@"try", .@"-", .@"-%" => {},
+//         else => return p.parsePrimaryExpr(token),
+//     };
+//     const rhsptr = try p.gpa.create(Node);
+//     const nexttkn = p.nextToken();
+//     rhsptr.* = try p.expectPrefixExpr(nexttkn);
+//     return .{
+//         .main_token = nexttkn,
+//         .data = .{
+//             .op_suffix_unary = .{
+//                 .result_type = null,
+//                 .rhs = rhsptr,
+//             }
+//         }
+//     };
+// }
+
+// fn parseExpr(p: *Parse) !?Node {
+//     return p.parseExprPrecedence(.start);
+// }
+
+const z85str = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWYZ.-:+=^!/*?&<>()[]{}@%$#";
+pub fn z85DigitToValue(digit: u8) u32 {
+    const lookup = b: {
+        var ary: [128] u8 = @splat(255);
+        for (z85str, 0..) |char, val| {
+            ary[char] = @intCast(val);
         }
+        break :b ary;
+    };
 
-        if (min_exc_prec.major == info.prec.major and min_exc_prec.assoc == .none and info.prec.assoc == .none) {
-            if (info.prec.major == .comparison) {
-                return p.fail(.chained_comparison_operators);
-            } else {
-                return p.fail(.illegal_chained_operators);
-            }
-        }
-
-        if (rel == .eq) {
-            break;
-        }
-
-        const oper_token = p.nextToken();
-        // Special-case handling for "catch"
-        // if (tok_tag == .keyword_catch) {
-        //     _ = try p.parsePayload();
-        // }
-        const rhs = try p.parseExprPrecedence(info.prec) orelse {
-            try p.warn(.expected_expr);
-            return node;
-        };
-
-        {
-            const tok_len = tok_tag.lexeme().?.len;
-            const char_before = p.source[p.tokenStart(oper_token) - 1];
-            const char_after = p.source[p.tokenStart(oper_token) + tok_len];
-            if (tok_tag == .ampersand and char_after == '&') {
-                // without types we don't know if '&&' was intended as 'bitwise_and address_of', or a c-style logical_and
-                // The best the parser can do is recommend changing it to 'and' or ' & &'
-                try p.warnMsg(.{ .tag = .invalid_ampersand_ampersand, .token = oper_token });
-            } else if (std.ascii.isWhitespace(char_before) != std.ascii.isWhitespace(char_after)) {
-                try p.warnMsg(.{ .tag = .mismatched_binary_op_whitespace, .token = oper_token });
-            }
-        }
-
-        node = try p.addNode(.{
-            .tag = info.tag,
-            .main_token = oper_token,
-            .data = .{ .node_and_node = .{ node, rhs } },
-        });
+    const val = lookup[digit];
+    if (val == 255) {
+        @branchHint(.cold);
+        std.debug.panic("Got bad digit `{c}` in z85 decoding.\n", .{digit});
     }
-
-    return node;
+    return val;
 }
 
-fn parsePrefixExpr(p: *Parse, token: Token) !?Node {
-    _ = switch (token.tag) {
-        .@"!", .@"~", .@"try", .@"-", .@"-%" => {},
-        else => return p.parsePrimaryExpr(token),
+///Cannot Error, our Tokenizer is responsible for that
+pub fn parseInteger(alloc: std.mem.Allocator, string: [] const u8) !int.Managed {
+    const State = enum {
+        start,
+        zero_prefix,
+        digit,
+        z85_value,
     };
-    const rhsptr = try p.gpa.create(Node);
-    const nexttkn = p.nextToken();
-    rhsptr.* = try p.expectPrefixExpr(nexttkn);
-    return .{
-        .main_token = nexttkn,
-        .data = .{
-            .op_suffix_unary = .{
-                .result_type = null,
-                .rhs = rhsptr,
+
+    var cumulative: int.Managed = try .initSet(alloc, 0);
+    errdefer cumulative.deinit();
+    var idx: usize = 0;
+    var base: int.Managed = try .init(alloc);
+    defer base.deinit();
+
+    sw: switch (State.start) {
+        .start => switch (string[idx]) {
+            '0' => {
+                idx += 1;
+                if (string.len == 1) break :sw;
+                continue :sw .zero_prefix;
+            },
+            '1'...'9' => {
+                try base.set(10);
+                continue :sw .digit;
+            },
+            'z' => {
+                try base.set(85);
+                idx += 2;
+                continue :sw .z85_value;
+            },
+            else => unreachable,
+        },
+        .zero_prefix => switch (string[idx]) {
+            '0'...'9' => {
+                try base.set(10);
+                continue :sw .digit;
+            },
+            'x' => {
+                try base.set(16);
+                idx += 1;
+                continue :sw .digit;
+            },
+            'b' => {
+                try base.set(2);
+                idx += 1;
+                continue :sw .digit;
+            },
+            'd' => {
+                try base.set(10);
+                idx += 1;
+                continue :sw .digit;
+            },
+            'o' => {
+                try base.set(8);
+                idx += 1;
+                continue :sw .digit;
+            },
+            else => unreachable,
+        },
+        .digit => {
+            switch (string[idx]) {
+                '_' => {},
+                '0'...'9' => |char| {
+                    try cumulative.mul(&cumulative, &base);
+                    try cumulative.addScalar(&cumulative, char - '0');
+                },
+                'a'...'f' => |char| {
+                    try cumulative.mul(&cumulative, &base);
+                    try cumulative.addScalar(&cumulative, 10 + char - 'a');
+                },
+                'A'...'F' => |char| {
+                    try cumulative.mul(&cumulative, &base);
+                    try cumulative.addScalar(&cumulative, 10 + char - 'A');
+                },
+                else => unreachable,
             }
-        }
-    };
-}
-
-fn parseExpr(p: *Parse) !?Node {
-    return p.parseExprPrecedence(.start);
+            idx += 1;
+            if (idx >= string.len) break: sw;
+            continue :sw .digit;
+        },
+        .z85_value => for (string[idx..]) |c| {
+            try cumulative.mul(&cumulative, &base);
+            try cumulative.addScalar(&cumulative, z85DigitToValue(c));
+        },
+    }
+    return cumulative;
 }
 
 test "Error" {
@@ -535,14 +644,15 @@ test "Error using Functions" {
     //We leave this some specifically so it can throw an error which gets caught and printed
 }
 
-test "Precedence" {
-    var p: Parse = .init(std.testing.allocator,
-        \\x + y * z
-    , .{});
+// test "Precedence" {
+//     var p: Parse = .init(std.testing.allocator,
+//         \\x + y * z
+//     , .{});
 
-    try p.initError();
-    defer p.deinitError();
-    defer p.printError();
+//     try p.initError();
+//     defer p.deinitError();
+//     defer p.printError();
 
-    _ = try p.parseExpr();
-}
+//     const node = try p.parseExpr();
+//     std.debug.print("Node is {}\n", .{node});
+// }
