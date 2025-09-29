@@ -16,17 +16,22 @@ qerror: ?Error,
 censureIsError: bool = true,
 warningIsError: bool = false,
 
-pub fn init(gpa: std.mem.Allocator, writer: *std.io.Writer, sourceFile: []const u8, defaults: struct { censureIsError: bool = true, warningIsError: bool = false }) Parse {
-    return .{
+tokenStream: Tokenizer.TokenList = undefined,
+
+pub fn init(gpa: std.mem.Allocator, writer: *std.io.Writer, sourceFile: []const u8, defaults: struct { censureIsError: bool = true, warningIsError: bool = false }) !Parse {
+    var self: Parse = .{
         .gpa = gpa,
         .writer = writer,
         .sourceFile = sourceFile,
         .qerror = null,
         .censureIsError = defaults.censureIsError,
         .warningIsError = defaults.warningIsError,
-        .prevToken = null,
-        .untokenStream = sourceFile,
     };
+    try self.initError();
+    errdefer self.deinitError();
+    errdefer self.printError();
+    self.tokenStream = try .fromParseFile(&self);
+    return self;
 }
 
 pub const MessageType = enum {
@@ -135,6 +140,11 @@ pub fn initError(self: *Parse) !void {
     self.qerror = .{
         .annots = annots,
     };
+}
+
+pub fn printDeinitError(self: *Parse) void {
+    self.printError();
+    self.deinitError();
 }
 
 pub fn deinitError(self: *Parse) void {
@@ -589,8 +599,7 @@ test "Error using Functions" {
     };
     {
         try p.initError();
-        defer p.deinitError();
-        defer p.printError();
+        defer p.printDeinitError();
 
         try p.newAnnot(.censure_, "TEST BUT CLEANER");
         try p.underlineSegment(p.sourceFile[26..][0..9], .{});
@@ -644,15 +653,37 @@ test "Error using Functions" {
     );
 }
 
+test "Test Tokenization Error" {
+    var allocWriter: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocWriter.deinit();
+    const pOrErr = Parse.init(
+        std.testing.allocator,
+        &allocWriter.writer,
+        \\pub fn Main() !void {
+        \\  return 0b0123456789;
+        \\}
+        , .{}
+    );
+    try std.testing.expectError(error.compilation_failure, pOrErr);
+    
+    try std.testing.expectEqualStrings(
+        \\  |
+        \\1 |    return 0b0123456789;
+        \\  |           ----^^^^^^^^
+        \\ERROR: Invalid Digit Sequence
+        \\
+        \\
+        , allocWriter.written()
+    );
+}
+
 // test "Precedence" {
 //     var p: Parse = .init(std.testing.allocator,
 //         \\x + y * z
 //     , .{});
 
 //     try p.initError();
-//     defer p.deinitError();
-//     defer p.printError();
-
+//     defer p.printDeinitError();
 //     const node = try p.parseExpr();
 //     std.debug.print("Node is {}\n", .{node}) catch {};
 // }

@@ -767,8 +767,7 @@ test "Test Token Errors" {
     };
     {
         try p.initError();
-        defer p.deinitError();
-        defer p.printError();
+        defer p.printDeinitError();
 
         var file = p.sourceFile;
         _  = readToken(&file, &p, null) catch {};
@@ -776,8 +775,7 @@ test "Test Token Errors" {
 
     {
         try p.initError();
-        defer p.deinitError();
-        defer p.printError();
+        defer p.printDeinitError();
 
         p.sourceFile = 
             \\0b010102;
@@ -789,8 +787,7 @@ test "Test Token Errors" {
 
     {
         try p.initError();
-        defer p.deinitError();
-        defer p.printError();
+        defer p.printDeinitError();
 
         p.sourceFile = 
             \\00FF1E;
@@ -835,8 +832,7 @@ test "Test TokenList Errors" {
     };
     {
         try p.initError();
-        defer p.deinitError();
-        defer p.printError();
+        defer p.printDeinitError();
 
         const err = TokenList.fromParseFile(&p);
         try std.testing.expectError(error.compilation_failure, err);
