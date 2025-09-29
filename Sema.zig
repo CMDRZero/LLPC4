@@ -8,6 +8,7 @@ structs: std.ArrayList(Struct),
 
 pub const Struct = struct {
     name: [] const u8,
+    fields: [] Field,
 
     pub const Field = struct {
         name: [] const u8,

@@ -16,12 +16,10 @@ qerror: ?Error,
 censureIsError: bool = true,
 warningIsError: bool = false,
 
-prevToken: ?Token = null,
-untokenStream: []const u8 = undefined,
-
-pub fn init(gpa: std.mem.Allocator, sourceFile: []const u8, defaults: struct { censureIsError: bool = true, warningIsError: bool = false }) Parse {
+pub fn init(gpa: std.mem.Allocator, writer: *std.io.Writer, sourceFile: []const u8, defaults: struct { censureIsError: bool = true, warningIsError: bool = false }) Parse {
     return .{
         .gpa = gpa,
+        .writer = writer,
         .sourceFile = sourceFile,
         .qerror = null,
         .censureIsError = defaults.censureIsError,

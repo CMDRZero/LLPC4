@@ -1,6 +1,42 @@
 const std = @import("std");
 const Parse = @import("Parse.zig");
 
+pub const TokenList = struct {
+    idx: usize,
+    tokens: [] Token,
+
+
+    pub fn current(self: TokenList) ?Token {
+        if (self.idx >= self.tokens.len) return null;
+        return self.tokens[self.idx];
+    }
+
+    pub fn consume(self: *TokenList) void {
+        self.idx += 1;
+    }
+
+    pub fn peek(self: TokenList) ?Token {
+        if (self.idx + 1 >= self.tokens.len) return null;
+        return self.tokens[self.idx + 1];
+    }
+
+    pub fn fromParseFile(p: *Parse) !TokenList {
+        var list: std.ArrayList(Token) = .empty;
+        errdefer list.deinit(p.gpa);
+        var prevToken: ?Token = null;
+        var stream = p.sourceFile;
+        while (stream.len != 0) {
+            const token = try readToken(&stream, p, prevToken);
+            try list.append(p.gpa, token);
+            prevToken = token;
+        }
+        return .{
+            .idx = 0,
+            .tokens = try list.toOwnedSlice(p.gpa),
+        };
+    }
+};
+
 pub const Token = struct {
     backingstr: [] const u8,
     skew: Skew,
@@ -719,9 +755,11 @@ test "Tokenization" {
 }
 
 test "Test Token Errors" {
-    if (1==1) return;
+    var allocWriter: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocWriter.deinit();
     var p: Parse = .{
         .gpa = std.testing.allocator,
+        .writer = &allocWriter.writer,
         .sourceFile = 
             \\+:
         ,
@@ -761,4 +799,55 @@ test "Test Token Errors" {
         const first  = try readToken(&file, &p, null);
         _ = readToken(&file, &p, first) catch {};
     }
+    try std.testing.expectEqualStrings(
+        \\  |
+        \\0 |    +:
+        \\  |    ^^
+        \\ERROR: Invalid Token
+        \\
+        \\  |
+        \\0 |    0b010102;
+        \\  |    -------^
+        \\ERROR: Invalid Digit Sequence
+        \\
+        \\  |
+        \\0 |    00FF1E;
+        \\  |    --^^^^
+        \\ERROR: Invalid Digit Sequence
+        \\
+        \\
+        , allocWriter.written()
+    );
+}
+
+test "Test TokenList Errors" {
+    var allocWriter: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocWriter.deinit();
+    var p: Parse = .{
+        .gpa = std.testing.allocator,
+        .writer = &allocWriter.writer,
+        .sourceFile = 
+            \\pub fn Main() !void {
+            \\  return 0b0123456789;
+            \\}
+        ,
+        .qerror = null,
+    };
+    {
+        try p.initError();
+        defer p.deinitError();
+        defer p.printError();
+
+        const err = TokenList.fromParseFile(&p);
+        try std.testing.expectError(error.compilation_failure, err);
+    }
+    try std.testing.expectEqualStrings(
+        \\  |
+        \\1 |    return 0b0123456789;
+        \\  |           ----^^^^^^^^
+        \\ERROR: Invalid Digit Sequence
+        \\
+        \\
+        , allocWriter.written()
+    );
 }
