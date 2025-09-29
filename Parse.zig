@@ -4,6 +4,8 @@ const Ast = @import("Ast.zig");
 const Node = Ast.Expr;
 const Tokenizer = @import("Tokenizer.zig");
 const Token = Tokenizer.Token;
+const types = @import("types.zig");
+const Type = types.Type;
 
 const int = std.math.big.int;
 
@@ -32,6 +34,10 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.io.Writer, sourceFile: []const 
     errdefer self.printError();
     self.tokenStream = try .fromParseFile(&self);
     return self;
+}
+
+pub fn deinit(self: *Parse) void {
+    return self.tokenStream.deinit(self.gpa);
 }
 
 pub const MessageType = enum {
@@ -493,7 +499,7 @@ pub fn z85DigitToValue(digit: u8) u32 {
 }
 
 ///Cannot Error, our Tokenizer is responsible for that
-pub fn parseInteger(alloc: std.mem.Allocator, string: [] const u8) !int.Managed {
+pub fn computeParsedInteger(alloc: std.mem.Allocator, string: [] const u8) !int.Managed {
     const State = enum {
         start,
         zero_prefix,
@@ -581,7 +587,91 @@ pub fn parseInteger(alloc: std.mem.Allocator, string: [] const u8) !int.Managed 
     return cumulative;
 }
 
+pub fn parseType(self: *Parse) !?Type {
+    return try self.parseTypeArgs(.{.access = .mut});
+}
 
+fn parseTypeArgs(self: *Parse, default: struct {access: Type.AccessQualifier = .view}) !?Type {
+    const data = try self.parseDataQualifier() orelse .@"var";
+    const access = try self.parseAccessQualifier() orelse default.access;
+    const tweak = try self.parseAlign();
+    _ = data;
+    _ = access;
+    _ = tweak;
+    return undefined;
+}
+
+fn parseDataQualifier(self: *Parse) !?Type.DataQualifier {
+    const token: Token = self.tokenStream.current() orelse return null;
+    self.tokenStream.consume();
+    if (token.tag == .@"const") return .@"const";
+    if (token.tag == .@"var") return .@"var";
+    if (token.tag == .@"volatile") return .@"volatile";
+    self.tokenStream.retreat();
+    return null;
+}
+
+fn parseAccessQualifier(self: *Parse) !?Type.AccessQualifier {
+    const token: Token = self.tokenStream.current() orelse return null;
+    self.tokenStream.consume();
+    if (token.tag == .@"view") return .@"view";
+    if (token.tag == .@"mut") return .@"mut";
+    self.tokenStream.retreat();
+    return null;
+}
+
+fn parseAlign(self: *Parse) !?usize {
+    const token: Token = self.tokenStream.current() orelse return null;
+    if (token.tag == .@"bitAlign") {
+        self.tokenStream.consume();
+        try self.expectToken(.@"(");
+        const value: int.Managed = try self.expectInteger();
+        try self.expectToken(.@")");
+        return try value.toInt(usize);
+    }
+    return null;
+}
+
+fn expectInteger(self: *Parse) !int.Managed {
+    return try self.parseInteger() orelse {
+        if (self.tokenStream.current()) |tkn| {
+            var buf: [128] u8 = @splat(' ');
+            try self.newAnnot(.error_, try std.fmt.bufPrint(&buf, "Expected Integer but found `{s}`", .{@tagName(tkn.tag)}));
+            try self.underlineSegment(tkn.backingstr, .{.mark = '^'});
+            try self.throwAnnot();
+        } else {
+            try self.newAnnot(.error_, "Expected Integer but found EOF");
+            self.tokenStream.retreat();
+            try self.underlineSegment(self.tokenStream.current().?.backingstr, .{});
+            try self.throwAnnot();
+        }
+        unreachable;
+    };
+}
+
+fn expectToken(self: *Parse, comptime token: Token.Tag) !void {
+    const tkn = self.tokenStream.current() orelse {
+        try self.newAnnot(.error_, "Expected Token but found EOF");
+        self.tokenStream.retreat();
+        try self.underlineSegment(self.tokenStream.current().?.backingstr, .{});
+        try self.throwAnnot();
+        unreachable;
+    };
+    if (tkn.tag == token) {
+        self.tokenStream.consume();
+        return;
+    }
+    try self.newAnnot(.error_, std.fmt.comptimePrint("Expected Token {}", .{token}));
+    try self.underlineSegment(self.tokenStream.current().?.backingstr, .{});
+    try self.throwAnnot();
+}
+
+fn parseInteger(self: *Parse) !?int.Managed {
+    const tkn = self.tokenStream.current() orelse return null;
+    if (tkn.tag != ._number) return null;
+    self.tokenStream.consume();
+    return try computeParsedInteger(self.gpa, tkn.backingstr);
+}
 
 test "Error using Functions" {
     var allocWriter: std.io.Writer.Allocating = .init(std.testing.allocator);
@@ -671,6 +761,37 @@ test "Test Tokenization Error" {
         \\1 |    return 0b0123456789;
         \\  |           ----^^^^^^^^
         \\ERROR: Invalid Digit Sequence
+        \\
+        \\
+        , allocWriter.written()
+    );
+}
+
+test "Type Parse Test" {
+    const file = 
+        \\const view bitAlign(?) T
+    ;
+
+    var allocWriter: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocWriter.deinit();
+    var p: Parse = try .init(
+        std.testing.allocator,
+        &allocWriter.writer,
+        file,
+        .{},
+    );
+    defer p.deinit();
+    
+    {
+        defer p.printDeinitError();
+        _ = p.parseType() catch {};
+    }
+    
+    try std.testing.expectEqualStrings(
+        \\  |
+        \\0 |    const view bitAlign(?) T
+        \\  |                        ^
+        \\ERROR: Expected Integer but found `?`
         \\
         \\
         , allocWriter.written()

@@ -14,6 +14,9 @@ pub const TokenList = struct {
     pub fn consume(self: *TokenList) void {
         self.idx += 1;
     }
+    pub fn retreat(self: *TokenList) void {
+        self.idx -= 1;
+    }
 
     pub fn peek(self: TokenList) ?Token {
         if (self.idx + 1 >= self.tokens.len) return null;
@@ -34,6 +37,18 @@ pub const TokenList = struct {
             .idx = 0,
             .tokens = try list.toOwnedSlice(p.gpa),
         };
+    }
+
+    pub fn deinit(self: *TokenList, alloc: std.mem.Allocator) void {
+        alloc.free(self.tokens);
+    }
+
+    pub fn save(p: TokenList) usize {
+        return p.idx;
+    }
+
+    pub fn load(p: *TokenList, idx: usize) void {
+        p.idx = idx;
     }
 };
 
@@ -158,6 +173,7 @@ pub const Token = struct {
         @"assert",
         @"error",
         
+        @"bitAlign",
         @"slice",
         @"array",
         @"int",

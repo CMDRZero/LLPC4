@@ -10,16 +10,16 @@ const bitsInUsize = @typeInfo(usize).int.bits;
 
 const int = std.math.big.int;
 
-const Root = union (enum) {
+pub const Root = union (enum) {
     int: RangedInt,
     struct_ref: StructRef,
 
 
-    const StructRef = struct {
+    pub const StructRef = struct {
         idx: Sema.Struct.Idx,
     };
     
-    const RangedInt = struct {
+    pub const RangedInt = struct {
         sign: Sign,     //If numBits is null, ignore this and treat as unsigned.
         numBits: ?usize,  //Nvm, guess we're doing usize here cuz why tf not
         lowerBoundInc: int.Managed,
@@ -86,25 +86,25 @@ const Root = union (enum) {
 
 };
 
-const Reference = struct {
-    const Prefix = union (enum) {
+pub const Reference = struct {
+    pub const Prefix = union (enum) {
         pointer,
         pointerToMany,
         slice,
     };
 
     prefix: Prefix,
-    referent: Type,
+    referent: *Type,
 };
 
-const Base = union (enum) {
+pub const Base = union (enum) {
     root: Root,
     reference: Reference,
 };
 
 const AggregateTag = std.meta.Tag(Aggregate);
-const Aggregate = union (enum) {
-    const Prefix = union (enum) {
+pub const Aggregate = union (enum) {
+    pub const Prefix = union (enum) {
         array: usize,
         nullable,
         errorable,
@@ -117,12 +117,12 @@ const Aggregate = union (enum) {
 
     base: Base,
 
-    const Prefixed = struct {
+    pub const Prefixed = struct {
         prefix: Prefix,
         aggregate: *Aggregate,
     };
 
-    const NameType = struct {
+    pub const NameType = struct {
         name: [] const u8,
         @"type": Type,
     };
@@ -134,16 +134,16 @@ pub const Type = struct {
     tweaks: Tweak,
     aggregate: Aggregate,
 
-    const Tweak = struct {
+    pub const Tweak = struct {
         alignment: ?usize,
     };  
 
-    const AccessQualifier = enum {
+    pub const AccessQualifier = enum {
         view,
         mut,
     };
 
-    const DataQualifier = enum {
+    pub const DataQualifier = enum {
         @"const",
         @"var",
         @"volatile",
@@ -178,7 +178,6 @@ pub const Type = struct {
             },
             name: [] const u8,
         }
-        
     };
     pub fn canCoerceTo(lhs: Type, rhs: Type) bool {
         return canCoerceToVerb(lhs, rhs) == null;
@@ -348,15 +347,16 @@ test "int[l..b]" {
     );
     
     allocWriter.clearRetainingCapacity();
-    var p: Parse = .init(std.testing.allocator,
+    var p: Parse = try .init(std.testing.allocator, &allocWriter.writer,
         \\int[0..100]
     , .{});
+    defer p.deinit();
 
     const lbs = p.sourceFile[4..5];
     const ubs = p.sourceFile[7..10];
-    var lb = try Parse.parseInteger(p.gpa, lbs);
+    var lb = try Parse.computeParsedInteger(p.gpa, lbs);
     errdefer lb.deinit();
-    var ub = try Parse.parseInteger(p.gpa, ubs);
+    var ub = try Parse.computeParsedInteger(p.gpa, ubs);
     errdefer ub.deinit();
     
     var ri: Root.RangedInt = try .init(testingAlloc, null, null, lb, ub);
@@ -386,5 +386,5 @@ test "uN[..]" {
 }
 
 test "Coercion" {
-    
+
 }
