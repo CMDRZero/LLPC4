@@ -4,6 +4,8 @@ const Sign = std.builtin.Signedness;
 const Alloc = std.mem.Allocator;
 const Parse = @import("Parse.zig");
 const Sema = @import("Sema.zig");
+const symbol = @import("Symbol.zig");
+const Symbol = symbol.Symbol;
 
 const maxbits = 1<<16;
 const bitsInUsize = @typeInfo(usize).int.bits;
@@ -112,14 +114,18 @@ pub const Aggregate = union (enum) {
 
     prefixed: Prefixed,
 
-    orderedTuple: [] Type,
-    fieldNamedTuple: [] NameType,
+    orderedTuple: OrderedTuple,
+    fieldNamedTuple: FieldNamedTuple,
 
     base: Base,
 
+    pub const OrderedTuple = [] Type;
+    pub const FieldNamedTuple = [] NameType;
+
+
     pub const Prefixed = struct {
         prefix: Prefix,
-        aggregate: *Aggregate,
+        aggregate: symbol.Table.Idx(Aggregate),
     };
 
     pub const NameType = struct {
@@ -132,10 +138,10 @@ pub const Type = struct {
     data: DataQualifier,
     access: AccessQualifier,
     tweaks: Tweak,
-    aggregate: Aggregate,
+    aggregate: symbol.Table.Idx(Aggregate),
 
     pub const Tweak = struct {
-        alignment: ?usize,
+        alignment: ?symbol.Table.Idx(usize),
     };  
 
     pub const AccessQualifier = enum {
