@@ -109,7 +109,7 @@ pub const Base = union (enum) {
 
 const AggregateTag = std.meta.Tag(Aggregate);
 pub const AstAggregate = union (enum) {
-    prefixed: Aggregate.Prefixed,
+    prefixed: Prefixed,
 
     orderedTuple: Aggregate.OrderedTuple,
     fieldNamedTuple: Aggregate.FieldNamedTuple,
@@ -135,19 +135,43 @@ pub const Aggregate = union (enum) {
 
     base: Base,
 
+    fn fromAst(p: *Parse, ref: SymbolTable.Reference) !Aggregate {
+        const ast: AstAggregate = try p.fromRef(ref, AstAggregate);
+        return switch (ast) {
+            .prefixed => |pref| b: {
+                const ptr = try p.arena.create(Aggregate);
+                ptr.* = try .fromAst(p, pref.aggregate);
+                break :b .{.prefixed = .{
+                    .prefix = try .fromAst(p, pref.prefix),
+                    .aggregate = ptr,
+                }};
+            },
+            .orderedTuple => |tup| .{.orderedTuple = tup},
+            .fieldNamedTuple => |tup| .{.fieldNamedTuple = tup},
+            .base => |b| .{.base = b},
+        };
+    }
+
     pub const OrderedTuple = [] Type;
     pub const FieldNamedTuple = [] NameType;
 
-
     pub const Prefixed = struct {
         prefix: Prefix,
-        aggregate: SymbolTable.Reference,
+        aggregate: *Aggregate,
     };
 
     pub const Prefix = union (enum) {
         array: usize,
         nullable,
         errorable,
+
+        fn fromAst(p: *Parse, ast: AstAggregate.Prefix) !Prefix {
+            return switch (ast) {
+                .array => |refN| .{.array = try p.fromRef(refN, usize)},
+                .nullable => .{.nullable = {}},
+                .errorable => .{.errorable = {}},
+            };
+        }
     };
 
     pub const NameType = struct {
@@ -188,13 +212,7 @@ pub const Type = struct {
     };
 
     pub fn resolve(p: *Parse, ref: SymbolTable.Reference) !Type {
-        const idx = try p.refToIdx(ref);
-        return .fromAst(p, (p.symboltable.getPtr(idx, AstType) orelse {
-            try p.newAnnot(.error_, try std.fmt.allocPrint(p.arena, "Expected `Type`, found `{s}`", .{p.symboltable.typeName(idx)}));
-            try p.underlineSegment(p.trie.getString(p.symboltable.getName(idx)).?, .{.mark = '^'});
-            try p.throwAnnot();
-            unreachable;
-        }).*);
+        return .fromAst(p, try p.fromRef(ref, AstType));
     }
 
     fn fromAst(p: *Parse, ast: AstType) !Type {
@@ -202,10 +220,20 @@ pub const Type = struct {
             .data = ast.data,
             .access = ast.access,
             .tweaks = .{.alignment = undefined},
-            .aggregate = .fromAst(p, ast.aggregate),
+            .aggregate = try .fromAst(p, ast.aggregate),
         };
-        self.tweaks.alignment = ast.tweaks.alignment orelse self.naturalAlignment();
+        if (ast.tweaks.alignment) |refAlign| {
+            self.tweaks.alignment = try p.fromRef(refAlign, usize);
+        } else {
+            self.tweaks.alignment = self.naturalAlignment();
+        }
+        
         return self;
+    }
+
+    fn naturalAlignment(self: Type) usize {
+        _ = self;
+        return 1;
     }
 
     pub const CoercionError = union (enum) {
@@ -266,6 +294,10 @@ pub const Type = struct {
         const lagr: Aggregate = lhs.aggregate;
         const ragr: Aggregate = rhs.aggregate;
 
+        return cctAggrAggr(lagr, ragr);
+    }
+
+    fn cctAggrAggr(lagr: Aggregate, ragr: Aggregate) ?CoercionError {
         var do = true;
         while (do) : (do = false) {
             //continue --> throw error
@@ -273,7 +305,7 @@ pub const Type = struct {
             //Noop --> break --> skip
             switch (lagr) {
                 .prefixed => |lpref| switch (ragr) {
-                    .prefixed => |rpref| if (cctPrefixPrefix(lpref, rpref)) |err| return err,
+                    .prefixed => |rpref| if (cctPrefixPrefix(lpref.prefix, rpref.prefix)) |err| return err,
                     else => continue,
                 },
                 .orderedTuple => |ltup| switch (ragr) {
@@ -298,7 +330,7 @@ pub const Type = struct {
                     .to = ragr,
             }};
         }
-        
+
         return null;
     }
 
@@ -310,7 +342,7 @@ pub const Type = struct {
                     else => break,
                 },
                 else => |tag1| switch (rhs) {
-                    else => |tag2| if (tag1 == tag2) return null,
+                    else => |tag2| if (std.meta.eql(tag1, tag2)) return null,
                 }
             }
             break;
@@ -376,11 +408,11 @@ pub const Type = struct {
 
     fn cctBasePrefix(lhs: Base, rhs: Aggregate.Prefixed) ?CoercionError {
         switch (rhs.prefix) {
-            .nullable, .errorable => if (lhs.canCoerceToVerb(rhs.aggregate.*)) |err| return err,
+            .nullable, .errorable => if (cctAggrAggr(Aggregate{.base = lhs}, rhs.aggregate.*)) |err| return err,
             else => return .{
                 .incompatible_aggregates = .{
                     .from = Aggregate{.base = lhs},
-                    .to = rhs,
+                    .to = .prefixed,
             }},
         }
 

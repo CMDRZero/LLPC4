@@ -316,6 +316,16 @@ pub fn refToIdx(self: *Parse, ref: SymbolTable.Reference) !SymbolTable.Idx {
     };
 }
 
+pub fn fromRef(self: *Parse, ref: SymbolTable.Reference, T: type) !T {
+    const idx = try self.refToIdx(ref);
+    return (self.symboltable.getPtr(idx, T) orelse {
+        try self.newAnnot(.error_, try std.fmt.allocPrint(self.arena, "Expected `{s}`, found `{s}`", .{@typeName(T), self.symboltable.typeName(idx)}));
+        try self.underlineSegment(self.trie.getString(self.symboltable.getName(idx)).?, .{.mark = '^'});
+        try self.throwAnnot();
+        unreachable;
+    }).*;
+}
+
 const Assoc = enum {
     left,
     none,
@@ -674,7 +684,7 @@ fn parseTypeArgs(self: *Parse, default: struct {access: Type.AccessQualifier = .
     const data = qdata orelse .@"var";
     const access = qaccess orelse default.access;
 
-    return try self.symboltable.addValueAndRef(Type {
+    return try self.symboltable.addValueAndRef(types.AstType {
         .data = data,
         .access = access,
         .tweaks = .{ .alignment = alignment },
@@ -694,7 +704,7 @@ fn expectAggregateType(self: *Parse) ParseError!SymbolTable.Reference {
 
 fn parseAggregateType(self: *Parse) ParseError!?SymbolTable.Reference {
     if (try self.isDefered(try self.someToken())) |r| return r;
-    const ret: types.Aggregate = b: {
+    const ret: types.AstAggregate = b: {
         if (try self.parseAggregatePrefixed()) |x| break :b .{.prefixed = x};
         if (try self.parseAggregateOrderedTuple()) |x| break :b .{.orderedTuple = x};
         if (try self.parseAggregateFieldNamedTuple()) |x| break :b .{.fieldNamedTuple = x};
@@ -703,29 +713,29 @@ fn parseAggregateType(self: *Parse) ParseError!?SymbolTable.Reference {
     return try self.symboltable.addValueAndRef(ret);
 }
 
-fn parseAggregatePrefixed(self: *Parse) ParseError!?types.Aggregate.Prefixed {
-    const prefix: types.Aggregate.Prefix = try self.parseAggregatePrefix() orelse return null;
+fn parseAggregatePrefixed(self: *Parse) ParseError!?types.AstAggregate.Prefixed {
+    const prefix: types.AstAggregate.Prefix = try self.parseAggregatePrefix() orelse return null;
     return .{
         .prefix = prefix,
         .aggregate = try self.expectAggregateType(),
     };
 }
 
-fn parseAggregatePrefix(self: *Parse) ParseError!?types.Aggregate.Prefix {
+fn parseAggregatePrefix(self: *Parse) ParseError!?types.AstAggregate.Prefix {
     return try self.parseArrayPrefix()
     orelse try self.parseNullPrefix()
     orelse try self.parseErrorPrefix();
 }
 
-fn parseArrayPrefix(self: *Parse) ParseError!?types.Aggregate.Prefix {
+fn parseArrayPrefix(self: *Parse) ParseError!?types.AstAggregate.Prefix {
     _ = self;
     return null; //Unimplemented
 }
-fn parseNullPrefix(self: *Parse) ParseError!?types.Aggregate.Prefix {
+fn parseNullPrefix(self: *Parse) ParseError!?types.AstAggregate.Prefix {
     _ = self;
     return null; //Unimplemented
 }
-fn parseErrorPrefix(self: *Parse) ParseError!?types.Aggregate.Prefix {
+fn parseErrorPrefix(self: *Parse) ParseError!?types.AstAggregate.Prefix {
     _ = self;
     return null; //Unimplemented
 }
@@ -1014,7 +1024,7 @@ test "Succeeding BitAlign" {
         defer p.printDeinitError();
         const typeRef = try p.parseType() orelse return error.Null;
         const typeIdx = try p.symboltable.toIdx(typeRef);
-        const kind = p.symboltable.getValue(typeIdx, Type).?;
+        const kind = p.symboltable.getValue(typeIdx, types.AstType).?;
         _ = kind;
     }
 
@@ -1086,7 +1096,7 @@ test "Type Resolution Failure Bad Type" {
 \\  |
 \\0 |    T;
 \\  |    ^
-\\ERROR: Expected `Type`, found `usize`
+\\ERROR: Expected `types.AstType`, found `usize`
 \\
 \\
         , allocWriter.written()
