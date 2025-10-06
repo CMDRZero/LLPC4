@@ -8,8 +8,7 @@ const types = @import("types.zig");
 const Type = types.Type;
 const Trie = @import("Trie.zig").Trie;
 
-const symbol = @import("Symbol.zig");
-const Symbol = symbol.Symbol;
+const SymbolTable = @import("SymbolTable.zig").SymbolTable;
 
 const int = std.math.big.int;
 
@@ -26,7 +25,7 @@ warningIsError: bool = false,
 
 tokenStream: Tokenizer.TokenList = undefined,
 
-table: symbol.Table = .empty,
+symboltable: SymbolTable = undefined,
 trie: Trie = undefined,
 
 const ParseError = error {
@@ -69,6 +68,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.io.Writer, sourceFile: []const 
         .censureIsError = defaults.censureIsError,
         .warningIsError = defaults.warningIsError,
         .trie = .init(gpa),
+        .symboltable = .init(arenaPtr.allocator()),
     };
     try self.initError();
     errdefer self.deinitError();
@@ -79,7 +79,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.io.Writer, sourceFile: []const 
 
 pub fn deinit(self: *Parse) void {
     self.tokenStream.deinit(self.gpa);
-    //self.table.deinit(self.gpa);
+    self.symboltable.deinit();
     self.trie.deinit(self.gpa);
     self.arena_.deinit();
     self.gpa.destroy(self.arena_);
@@ -289,13 +289,31 @@ pub fn nextToken(self: *Parse) !Token {
     return Tokenizer.readToken(self.untokenStream, self.prevToken);
 }
 
-pub fn isDefered(self: *Parse, token: Token, T: type) !?symbol.Table.Idx(T) {
+pub fn isDefered(self: *Parse, token: Token) !?SymbolTable.Reference {
+    if (token.tag == .@"infer") {
+        self.tokenStream.consume();
+        const tkn = try self.someToken();
+        try self.expectToken(._identifier);
+        const string = try std.mem.concat(self.arena, u8, &[2][]const u8{"infer ", tkn.backingstr});
+        const str = try self.trie.writeGet(string);
+        //self.gpa.free(string);
+        return SymbolTable.refName(str);
+    }
     if (token.tag == ._identifier) {
         self.tokenStream.consume();
         const str = try self.trie.writeGet(token.backingstr);
-        return try self.table.appendNamedUndefined(self.arena, str, T);
+        return SymbolTable.refName(str);
     }
     return null;
+}
+
+pub fn refToIdx(self: *Parse, ref: SymbolTable.Reference) !SymbolTable.Idx {
+    return self.symboltable.toIdx(ref) catch {
+        try self.newAnnot(.error_, "Undefined Reference");
+        try self.underlineSegment(self.trie.getString(ref.name.name).?, .{.mark = '^'});
+        try self.throwAnnot();
+        unreachable;
+    };
 }
 
 const Assoc = enum {
@@ -641,12 +659,12 @@ pub fn computeParsedInteger(alloc: std.mem.Allocator, string: [] const u8) !int.
     return cumulative;
 }
 
-pub fn parseType(self: *Parse) ParseError!?symbol.Table.Idx(Type) {
+pub fn parseType(self: *Parse) ParseError!?SymbolTable.Reference {
     return try self.parseTypeArgs(.{.access = .mut});
 }
 
-fn parseTypeArgs(self: *Parse, default: struct {access: Type.AccessQualifier = .view}) ParseError!?symbol.Table.Idx(Type) {
-    if (try self.isDefered(try self.someToken(), Type)) |r| return r;
+fn parseTypeArgs(self: *Parse, default: struct {access: Type.AccessQualifier = .view}) ParseError!?SymbolTable.Reference {
+    if (try self.isDefered(try self.someToken())) |r| return r;
     const qdata = try self.parseDataQualifier();
     const qaccess = try self.parseAccessQualifier();
     const alignment = try self.parseAlign();
@@ -656,7 +674,7 @@ fn parseTypeArgs(self: *Parse, default: struct {access: Type.AccessQualifier = .
     const data = qdata orelse .@"var";
     const access = qaccess orelse default.access;
 
-    return try self.table.appendUnnamedValue(self.arena, Type {
+    return try self.symboltable.addValueAndRef(Type {
         .data = data,
         .access = access,
         .tweaks = .{ .alignment = alignment },
@@ -664,7 +682,7 @@ fn parseTypeArgs(self: *Parse, default: struct {access: Type.AccessQualifier = .
     });
 }
 
-fn expectAggregateType(self: *Parse) ParseError!symbol.Table.Idx(types.Aggregate) {
+fn expectAggregateType(self: *Parse) ParseError!SymbolTable.Reference {
     return try self.parseAggregateType() orelse {
         const tkn = try self.someToken();
         try self.newAnnot(.error_, "Expected Aggregate Type");
@@ -674,15 +692,15 @@ fn expectAggregateType(self: *Parse) ParseError!symbol.Table.Idx(types.Aggregate
     };
 }
 
-fn parseAggregateType(self: *Parse) ParseError!?symbol.Table.Idx(types.Aggregate) {
-    if (try self.isDefered(try self.someToken(), types.Aggregate)) |r| return r;
+fn parseAggregateType(self: *Parse) ParseError!?SymbolTable.Reference {
+    if (try self.isDefered(try self.someToken())) |r| return r;
     const ret: types.Aggregate = b: {
         if (try self.parseAggregatePrefixed()) |x| break :b .{.prefixed = x};
         if (try self.parseAggregateOrderedTuple()) |x| break :b .{.orderedTuple = x};
         if (try self.parseAggregateFieldNamedTuple()) |x| break :b .{.fieldNamedTuple = x};
         return null;
     };
-    return try self.table.appendUnnamedValue(self.arena, ret);
+    return try self.symboltable.addValueAndRef(ret);
 }
 
 fn parseAggregatePrefixed(self: *Parse) ParseError!?types.Aggregate.Prefixed {
@@ -747,18 +765,19 @@ fn parseAccessQualifier(self: *Parse) ParseError!?Type.AccessQualifier {
     return tag;
 }
 
-fn parseAlign(self: *Parse) ParseError!?symbol.Table.Idx(usize) {
+fn parseAlign(self: *Parse) ParseError!?SymbolTable.Reference {
     const token: Token = self.tokenStream.current() orelse return null;
     if (token.tag == .@"bitAlign") {
         self.tokenStream.consume();
         try self.expectToken(.@"(");
-        var ret: symbol.Table.Idx(usize) = undefined;
-        if (try self.isDefered(try self.someToken(), usize)) |r| {
+        var ret: SymbolTable.Reference = undefined;
+        if (try self.isDefered(try self.someToken())) |r| {
             ret = r;
         } else { 
-            const valueIdx: symbol.Table.Idx(int.Managed) = try self.expectInteger();
-            const value = self.table.getValue(valueIdx) catch self.compilerError("Set value was marked as not set", .{});
-            ret = try self.table.appendUnnamedValue(self.arena, try value.toInt(usize));
+            const valueRef: SymbolTable.Reference = try self.expectInteger();
+            const idx = self.symboltable.toIdx(valueRef) catch self.compilerError("Did not write", .{});
+            const value = self.symboltable.getValue(idx, int.Managed) orelse self.compilerError("Incorrectly typed", .{});
+            ret = try self.symboltable.addValueAndRef(try value.toInt(usize));
         }
         try self.expectToken(.@")");
         return ret;
@@ -766,7 +785,7 @@ fn parseAlign(self: *Parse) ParseError!?symbol.Table.Idx(usize) {
     return null;
 }
 
-fn expectInteger(self: *Parse) !symbol.Table.Idx(int.Managed) {
+fn expectInteger(self: *Parse) !SymbolTable.Reference {
     return try self.parseInteger() orelse {
         if (self.tokenStream.current()) |tkn| {
             var buf: [128] u8 = @splat(' ');
@@ -810,13 +829,13 @@ fn someToken(self: *Parse) !Token {
     };
 }
 
-fn parseInteger(self: *Parse) ParseError!?symbol.Table.Idx(int.Managed) {
+fn parseInteger(self: *Parse) ParseError!?SymbolTable.Reference {
     const tkn = self.tokenStream.current() orelse return null;
-    if (try self.isDefered(tkn, int.Managed)) |r| return r;
+    if (try self.isDefered(tkn)) |r| return r;
     if (tkn.tag != ._number) return null;
     self.tokenStream.consume();
     const value =  try computeParsedInteger(self.arena, tkn.backingstr);
-    return try self.table.appendUnnamedValue(self.arena, value);
+    return try self.symboltable.addValueAndRef(value);
 }
 
 test "Error using Functions" {
@@ -977,7 +996,7 @@ test "Failing BitAlign" {
 
 test "Succeeding BitAlign" {
     const file = 
-        \\const view bitAlign(N) T
+        \\const view bitAlign(N) infer T
     ;
 
     var allocWriter: std.io.Writer.Allocating = .init(std.testing.allocator);
@@ -993,14 +1012,83 @@ test "Succeeding BitAlign" {
     
     {
         defer p.printDeinitError();
-        const kindIdx = try p.parseType() orelse return error.Null;
-        const kind = try p.table.getValue(kindIdx);
+        const typeRef = try p.parseType() orelse return error.Null;
+        const typeIdx = try p.symboltable.toIdx(typeRef);
+        const kind = p.symboltable.getValue(typeIdx, Type).?;
         _ = kind;
     }
-    
 
     try std.testing.expectEqualStrings(
         ""
+        , allocWriter.written()
+    );
+}
+
+test "Type Resolution Failure Undef" {
+    const file = 
+        \\T;
+    ;
+
+    var allocWriter: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocWriter.deinit();
+    errdefer std.debug.print("{s}\n", .{allocWriter.written()});
+    var p: Parse = try .init(
+        std.testing.allocator,
+        &allocWriter.writer,
+        file,
+        .{},
+    );
+    defer p.deinit();
+    
+    {
+        defer p.printDeinitError();
+        const typeRef = try p.parseType() orelse return error.Null;
+        _ = Type.resolve(&p, typeRef) catch {};
+    }
+
+    try std.testing.expectEqualStrings(
+\\  |
+\\0 |    T;
+\\  |    ^
+\\ERROR: Undefined Reference
+\\
+\\
+        , allocWriter.written()
+    );
+}
+
+test "Type Resolution Failure Bad Type" {
+    const file = 
+        \\T;
+        \\const T = 128;
+    ;
+
+    var allocWriter: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocWriter.deinit();
+    errdefer std.debug.print("{s}\n", .{allocWriter.written()});
+    var p: Parse = try .init(
+        std.testing.allocator,
+        &allocWriter.writer,
+        file,
+        .{},
+    );
+    defer p.deinit();
+    
+    {
+        defer p.printDeinitError();
+        const typeRef = try p.parseType() orelse return error.Null;
+        const name = try p.trie.writeGet("T");
+        try p.symboltable.assignNamedValue(name, @as(usize, 128));
+        _ = Type.resolve(&p, typeRef) catch {};
+    }
+
+    try std.testing.expectEqualStrings(
+\\  |
+\\0 |    T;
+\\  |    ^
+\\ERROR: Expected `Type`, found `usize`
+\\
+\\
         , allocWriter.written()
     );
 }

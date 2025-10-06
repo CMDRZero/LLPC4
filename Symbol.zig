@@ -27,6 +27,7 @@ pub const Table = struct {
         name: Trie.ID,
         ptr: *anyopaque,
     };
+
     table: std.ArrayList(Item),
 
     pub const empty: Table = .{.table = .empty};

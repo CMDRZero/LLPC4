@@ -4,8 +4,7 @@ const Sign = std.builtin.Signedness;
 const Alloc = std.mem.Allocator;
 const Parse = @import("Parse.zig");
 const Sema = @import("Sema.zig");
-const symbol = @import("Symbol.zig");
-const Symbol = symbol.Symbol;
+const SymbolTable = @import("SymbolTable.zig").SymbolTable;
 
 const maxbits = 1<<16;
 const bitsInUsize = @typeInfo(usize).int.bits;
@@ -88,6 +87,10 @@ pub const Root = union (enum) {
 
 };
 
+pub const AstReference = struct {
+    prefix: Reference.Prefix,
+    referent: SymbolTable.Reference,
+};
 pub const Reference = struct {
     pub const Prefix = union (enum) {
         pointer,
@@ -105,13 +108,26 @@ pub const Base = union (enum) {
 };
 
 const AggregateTag = std.meta.Tag(Aggregate);
-pub const Aggregate = union (enum) {
+pub const AstAggregate = union (enum) {
+    prefixed: Aggregate.Prefixed,
+
+    orderedTuple: Aggregate.OrderedTuple,
+    fieldNamedTuple: Aggregate.FieldNamedTuple,
+
+    base: Base,
+
+    pub const Prefixed = struct {
+        prefix: Prefix,
+        aggregate: SymbolTable.Reference,
+    };
+
     pub const Prefix = union (enum) {
-        array: usize,
+        array: SymbolTable.Reference,
         nullable,
         errorable,
     };
-
+};
+pub const Aggregate = union (enum) {
     prefixed: Prefixed,
 
     orderedTuple: OrderedTuple,
@@ -125,7 +141,13 @@ pub const Aggregate = union (enum) {
 
     pub const Prefixed = struct {
         prefix: Prefix,
-        aggregate: symbol.Table.Idx(Aggregate),
+        aggregate: SymbolTable.Reference,
+    };
+
+    pub const Prefix = union (enum) {
+        array: usize,
+        nullable,
+        errorable,
     };
 
     pub const NameType = struct {
@@ -134,14 +156,24 @@ pub const Aggregate = union (enum) {
     };
 };
 
+pub const AstType = struct {
+    data: Type.DataQualifier,
+    access: Type.AccessQualifier,
+    tweaks: Tweak,
+    aggregate: SymbolTable.Reference,
+
+    pub const Tweak = struct {
+        alignment: ?SymbolTable.Reference,
+    };  
+};
 pub const Type = struct {
     data: DataQualifier,
     access: AccessQualifier,
     tweaks: Tweak,
-    aggregate: symbol.Table.Idx(Aggregate),
+    aggregate: Aggregate,
 
     pub const Tweak = struct {
-        alignment: ?symbol.Table.Idx(usize),
+        alignment: usize,
     };  
 
     pub const AccessQualifier = enum {
@@ -154,6 +186,27 @@ pub const Type = struct {
         @"var",
         @"volatile",
     };
+
+    pub fn resolve(p: *Parse, ref: SymbolTable.Reference) !Type {
+        const idx = try p.refToIdx(ref);
+        return .fromAst(p, (p.symboltable.getPtr(idx, AstType) orelse {
+            try p.newAnnot(.error_, try std.fmt.allocPrint(p.arena, "Expected `Type`, found `{s}`", .{p.symboltable.typeName(idx)}));
+            try p.underlineSegment(p.trie.getString(p.symboltable.getName(idx)).?, .{.mark = '^'});
+            try p.throwAnnot();
+            unreachable;
+        }).*);
+    }
+
+    fn fromAst(p: *Parse, ast: AstType) !Type {
+        var self: Type = .{
+            .data = ast.data,
+            .access = ast.access,
+            .tweaks = .{.alignment = undefined},
+            .aggregate = .fromAst(p, ast.aggregate),
+        };
+        self.tweaks.alignment = ast.tweaks.alignment orelse self.naturalAlignment();
+        return self;
+    }
 
     pub const CoercionError = union (enum) {
         incompatible_data_qualifiers: struct {
@@ -201,13 +254,14 @@ pub const Type = struct {
                 .to = rhs.data,
         }};
         if (lhs.access == .view and rhs.access == .mut) return .{
-            .discard_view,
+            .discard_view = {},
         };
-        if (lhs.tweaks.alignment < rhs.tweaks.alignment) return .{
-            .widens_alignment = .{
-                .from = lhs.tweaks.alignment, 
-                .to = rhs.tweaks.alignment,
-        }};
+        // const lhsAlign = 
+        // if (lhs.tweaks.alignment < rhs.tweaks.alignment) return .{
+        //     .widens_alignment = .{
+        //         .from = lhs.tweaks.alignment, 
+        //         .to = rhs.tweaks.alignment,
+        // }};
         
         const lagr: Aggregate = lhs.aggregate;
         const ragr: Aggregate = rhs.aggregate;
@@ -392,5 +446,32 @@ test "uN[..]" {
 }
 
 test "Coercion" {
+    const file = 
+        \\u32 uptr
+    ;
 
+    var allocWriter: std.io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocWriter.deinit();
+    errdefer std.debug.print("{s}\n", .{allocWriter.written()});
+    var p: Parse = try .init(
+        std.testing.allocator,
+        &allocWriter.writer,
+        file,
+        .{},
+    );
+    defer p.deinit();
+    
+    {
+        defer p.printDeinitError();
+        
+        const orig: Type = try .resolve(&p, (try p.parseType()).?);
+        const dest: Type = try .resolve(&p, (try p.parseType()).?);
+        const result = orig.canCoerceToVerb(dest);
+        try std.testing.expectEqual(null, result);
+    }
+
+    try std.testing.expectEqualStrings(
+        ""
+        , allocWriter.written()
+    );
 }
